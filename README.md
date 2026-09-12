@@ -1,5 +1,5 @@
 # NovaBank Predictive Model
-### Analytics Methods and Frameworks — Quantic MSBA · May 2026
+### Analytics Methods and Frameworks — Quantic MSBA · September 2026
 **Authors:** Mduduzi Ndlovu & Mukabalengu S. Mukuni
 
 ---
