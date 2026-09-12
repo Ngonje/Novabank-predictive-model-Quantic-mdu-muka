@@ -7,7 +7,7 @@ Dataset:   bank-full.csv (same folder)
 """
 
 import streamlit as st
-import pandas as pd
+import pandas as pd # type: ignore
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
@@ -212,7 +212,10 @@ def load_and_prepare():
     X_train[numeric_cols] = scaler.fit_transform(X_train[numeric_cols])
     X_test[numeric_cols]  = scaler.transform(X_test[numeric_cols])
 
-    return df, X_train, X_test, y_train, y_test
+    # Returned alongside the data so every other page (including the manual
+    # Customer Prediction form) scales new rows with this exact fitted
+    # scaler, instead of each caller re-fitting its own copy from scratch.
+    return df, X_train, X_test, y_train, y_test, scaler, numeric_cols
 
 @st.cache_resource(show_spinner="Training models…")
 def train_models(_X_train, _y_train):
@@ -242,9 +245,118 @@ def run_segmentation(_df):
     _df['priority'] = _df['cluster'].map(priority)
     return _df
 
+# ── PRE-CONTACT SEGMENT ESTIMATE ────────────────────────────────────────────────
+# The official K-Means segmentation above is fit on ['age','balance','duration',
+# 'campaign','previous'] — it includes call duration, so it can only be computed
+# *after* a call happens. It cannot legitimately be reused to assign a segment to
+# a hypothetical customer before they've been called. Rather than silently
+# ignoring that, we compute each segment's average profile on the four
+# pre-contact features only, and match a new customer to the segment whose
+# profile they sit closest to. This is a pre-contact approximation shown as a
+# distinct, clearly-labelled estimate — not the same as the official label.
+PRECONTACT_FEATURES = ['age', 'balance', 'campaign', 'previous']
+
+@st.cache_data(show_spinner=False)
+def get_precontact_segment_profiles(_df_seg):
+    profiles = _df_seg[_df_seg['segment'] != 'Statistical Outlier'].groupby('segment')[PRECONTACT_FEATURES].mean()
+    spread   = _df_seg[PRECONTACT_FEATURES].std().replace(0, 1)
+    priority_lookup = (
+        _df_seg[_df_seg['segment'] != 'Statistical Outlier']
+        .groupby('segment')['priority'].first()
+    )
+    return profiles, spread, priority_lookup
+
+def estimate_precontact_segment(age, balance, campaign, previous, profiles, spread):
+    """Nearest-centroid match on pre-contact features only (no duration)."""
+    customer = pd.Series({'age': age, 'balance': balance,
+                           'campaign': campaign, 'previous': previous})
+    z_diff = (profiles[PRECONTACT_FEATURES] - customer) / spread[PRECONTACT_FEATURES]
+    distance = (z_diff ** 2).sum(axis=1)
+    return distance.idxmin()
+
+# ── PRE-CALL MODEL ─────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner="Training pre-call model…")
+def train_pre_call_model(_X_train, _y_train):
+    """
+    Train the duration-excluded Random Forest used for customer prediction
+    before an outbound call. This follows the notebook's two-stage deployment
+    recommendation and avoids duration leakage.
+    """
+    duration_cols = [c for c in _X_train.columns if 'duration' in c]
+    X_nd = _X_train.drop(columns=duration_cols)
+
+    rf_nd = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=15,
+        min_samples_leaf=10,
+        class_weight='balanced',
+        random_state=42,
+        n_jobs=-1
+    )
+    rf_nd.fit(X_nd, _y_train)
+    return rf_nd, duration_cols
+
+
+def prepare_manual_customer(
+    age, job, marital, education, default, balance, housing, loan,
+    contact, month, campaign, previous_count, days_since_previous,
+    previous_outcome
+):
+    """Apply the same feature engineering/encoding used by the notebook."""
+    previously_contacted = previous_count > 0
+    pdays = days_since_previous if previously_contacted else -1
+
+    row = pd.DataFrame([{
+        'age': age,
+        'job': job,
+        'marital': marital,
+        'education': education,
+        'default': default,
+        'balance': balance,
+        'housing': housing,
+        'loan': loan,
+        'contact': contact,
+        'month': month,
+        'campaign': campaign,
+        'pdays': pdays,
+        'previous': previous_count,
+        'poutcome': previous_outcome if previously_contacted else 'unknown'
+    }])
+
+    # Same feature engineering as load_and_prepare()
+    row['was_previously_contacted'] = (row['pdays'] != -1).astype(int)
+    row['pdays_clean'] = row['pdays'].replace(-1, 0)
+    row['duration_bucket'] = 'very_short'  # excluded by the pre-call model
+    row['age_group'] = pd.cut(
+        row['age'],
+        bins=[0,25,35,45,55,65,100],
+        labels=['under25','25-34','35-44','45-54','55-64','65+']
+    )
+    row['negative_balance'] = (row['balance'] < 0).astype(int)
+    row['high_campaign_count'] = (row['campaign'] > 5).astype(int)
+
+    row['education_ord'] = row['education'].map({
+        'unknown':0, 'primary':1, 'secondary':2, 'tertiary':3
+    })
+    for col in ['default','housing','loan']:
+        row[col] = (row[col] == 'yes').astype(int)
+
+    nominal = [
+        'job','marital','contact','month','poutcome',
+        'duration_bucket','age_group'
+    ]
+    row = pd.get_dummies(row, columns=nominal, drop_first=True)
+    row = row.drop(columns=['education','y','pdays'], errors='ignore')
+
+    # Align exactly to the training columns.
+    return row
+
+
+
 # ── LOAD EVERYTHING ────────────────────────────────────────────────────────────
-df_raw, X_train, X_test, y_train, y_test = load_and_prepare()
+df_raw, X_train, X_test, y_train, y_test, scaler, numeric_cols = load_and_prepare()
 lr_model, rf_model = train_models(X_train, y_train)
+rf_nd_model, duration_cols = train_pre_call_model(X_train, y_train)
 
 lr_prob = lr_model.predict_proba(X_test)[:, 1]
 rf_prob = rf_model.predict_proba(X_test)[:, 1]
@@ -253,6 +365,15 @@ X_full    = pd.concat([X_train, X_test])
 rf_full   = rf_model.predict_proba(X_full)[:, 1]
 df_seg    = run_segmentation(df_raw)
 df_seg['rf_score'] = rf_full
+
+# Pre-call score for the SAME customers, using the duration-excluded model.
+# 'rf_score' above is a legitimate retrospective diagnostic (these historical
+# customers were already called, so their real duration is known — that's
+# fine for understanding what happened). It is NOT valid for deciding who to
+# call NEXT, because a not-yet-called customer has no duration value at all.
+# Any forward-looking priority list must rank customers by this score instead.
+X_full_nd = X_full.drop(columns=duration_cols)
+df_seg['rf_precall_score'] = rf_nd_model.predict_proba(X_full_nd)[:, 1]
 
 # ── SIDEBAR ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -267,6 +388,8 @@ with st.sidebar:
         "📊  Overview",
         "🤖  Model Performance",
         "🎯  Threshold Explorer",
+        "👤  Customer Prediction",
+        "📋  Priority Call List",
         "👥  Customer Segments",
         "💡  Segment Insights",
     ], label_visibility="collapsed")
@@ -277,7 +400,7 @@ with st.sidebar:
     st.markdown("<div style='font-size:11px;color:#8B949E;margin-top:8px;'>Models</div>", unsafe_allow_html=True)
     st.markdown("<div style='font-size:13px;color:#C9D1D9;'>Logistic Regression · Random Forest</div>", unsafe_allow_html=True)
     st.markdown("<div style='font-size:11px;color:#8B949E;margin-top:8px;'>Segmentation</div>", unsafe_allow_html=True)
-    st.markdown("<div style='font-size:13px;color:#C9D1D9;'>K-Means (k=8, silhouette-optimised)</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size:13px;color:#C9D1D9;'>Finalised K-Means segmentation (k=8)</div>", unsafe_allow_html=True)
     st.markdown("---")
     st.markdown("<div style='font-size:11px;color:#8B949E;'>MSBA Capstone · Quantic · 2026</div>", unsafe_allow_html=True)
 
@@ -344,10 +467,17 @@ if "Overview" in page:
                           xaxis_title='Subscription rate (%)')
         st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("""
+    thresh_ov  = 0.15
+    pred_ov    = (rf_prob >= thresh_ov).astype(int)
+    tp_ov      = int(((pred_ov == 1) & (y_test == 1)).sum())
+    fp_ov      = int(((pred_ov == 1) & (y_test == 0)).sum())
+    recall_ov  = tp_ov / y_test.sum()
+    called_pct = (tp_ov + fp_ov) / len(y_test)
+
+    st.markdown(f"""
     <div class='insight-box'>
-    <strong>Decision rule:</strong> Contact every customer with predicted subscription probability ≥ 0.15.
-    This captures 98.7% of subscribers while reducing call volume by 52% — estimated $1.69M annual net impact.
+    <strong>Decision rule:</strong> Contact every customer with predicted subscription probability ≥ {thresh_ov:.2f}.
+    This captures {recall_ov:.0%} of subscribers while reducing call volume by {1 - called_pct:.0%} — estimated $1.69M annual net impact.
     </div>
     <div class='insight-box blue'>
     <strong>Why not accuracy?</strong> A model that always predicts "no" achieves 88.3% accuracy but catches zero
@@ -532,7 +662,293 @@ elif "Threshold" in page:
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 4 — CUSTOMER SEGMENTS
+# PAGE 4 — CUSTOMER PREDICTION
+# ══════════════════════════════════════════════════════════════════════════════
+elif "Customer Prediction" in page:
+
+    st.markdown(
+        "<div class='section-head'>Customer Subscription Prediction</div>",
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        "<div style='font-size:13px;color:#8B949E;margin-bottom:16px;'>"
+        "Enter a customer's characteristics to estimate their probability of "
+        "subscribing to a term deposit before making an outbound call."
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+    st.markdown("""
+    <div class='insight-box blue'>
+    <strong>Pre-call prediction:</strong> This page uses the duration-excluded
+    Random Forest model. Call duration is deliberately not used because it is
+    only known after the call.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        "<div class='section-head'>Customer Characteristics</div>",
+        unsafe_allow_html=True
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        age = st.number_input("Age", min_value=18, max_value=100, value=40, step=1)
+        job = st.selectbox(
+            "Job",
+            sorted(df_raw['job'].dropna().unique().tolist()),
+            index=sorted(df_raw['job'].dropna().unique().tolist()).index('management')
+            if 'management' in df_raw['job'].unique() else 0
+        )
+        marital = st.selectbox(
+            "Marital status",
+            sorted(df_raw['marital'].dropna().unique().tolist()),
+            index=sorted(df_raw['marital'].dropna().unique().tolist()).index('married')
+            if 'married' in df_raw['marital'].unique() else 0
+        )
+        education = st.selectbox(
+            "Education",
+            ['primary', 'secondary', 'tertiary', 'unknown'],
+            index=1
+        )
+
+    with c2:
+        default = st.selectbox("Has credit in default?", ['no', 'yes'])
+        balance = st.number_input(
+            "Account balance (€)", min_value=-10000, max_value=1000000,
+            value=1500, step=100
+        )
+        housing = st.selectbox("Has housing loan?", ['no', 'yes'], index=0)
+        loan = st.selectbox("Has personal loan?", ['no', 'yes'], index=0)
+
+    with c3:
+        contact = st.selectbox(
+            "Contact method",
+            ['cellular', 'telephone', 'unknown'],
+            index=0
+        )
+        month = st.selectbox(
+            "Campaign month",
+            ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'],
+            index=4
+        )
+        campaign = st.number_input(
+            "Contacts in current campaign", min_value=1, max_value=50,
+            value=1, step=1
+        )
+        previous_count = st.number_input(
+            "Number of prior contacts (before this campaign)",
+            min_value=0, max_value=50, value=0, step=1
+        )
+
+    previous_contacted_bool = previous_count > 0
+
+    if previous_contacted_bool:
+        c4, c5 = st.columns(2)
+        with c4:
+            days_since_previous = st.number_input(
+                "Days since previous campaign contact",
+                min_value=1, max_value=1000, value=30, step=1
+            )
+        with c5:
+            previous_outcome = st.selectbox(
+                "Previous campaign outcome",
+                ['success', 'failure', 'other', 'unknown'],
+                index=0
+            )
+    else:
+        days_since_previous = 0
+        previous_outcome = 'unknown'
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    predict_col, threshold_col = st.columns([2, 1])
+    with threshold_col:
+        prediction_threshold = st.number_input(
+            "Decision threshold",
+            min_value=0.01, max_value=0.90, value=0.15, step=0.01,
+            format="%.2f"
+        )
+
+    with predict_col:
+        predict_clicked = st.button(
+            "🎯 Predict Subscription Likelihood",
+            type="primary",
+            use_container_width=True
+        )
+
+    if predict_clicked:
+        input_row = prepare_manual_customer(
+            age, job, marital, education, default, balance, housing, loan,
+            contact, month, campaign, previous_count,
+            days_since_previous, previous_outcome
+        )
+
+        # Align to the exact duration-excluded training feature set.
+        X_nd_train = X_train.drop(columns=duration_cols)
+        input_row = input_row.reindex(columns=X_nd_train.columns, fill_value=0)
+
+        # Scale the pre-call numeric features with the *same* scaler fitted
+        # once in load_and_prepare() — StandardScaler scales each column
+        # independently, so applying its per-column mean/scale here is
+        # identical to how these columns were scaled during training, even
+        # though 'duration' itself has already been dropped from this row.
+        numeric_cols_nd = [c for c in numeric_cols if c != 'duration' and c in input_row.columns]
+        for col in numeric_cols_nd:
+            idx = numeric_cols.index(col)
+            input_row[col] = (
+                input_row[col].astype(float) - scaler.mean_[idx]
+            ) / scaler.scale_[idx]
+
+        probability = float(rf_nd_model.predict_proba(input_row)[0, 1])
+        contacted = probability >= prediction_threshold
+
+        if probability >= 0.50:
+            band = "High likelihood"
+            band_color = GREEN
+            recommendation = "Prioritise this customer for outreach."
+        elif probability >= prediction_threshold:
+            band = "Above targeting threshold"
+            band_color = GREEN
+            recommendation = "Include this customer in the targeted campaign."
+        elif probability >= 0.10:
+            band = "Moderate likelihood"
+            band_color = AMBER
+            recommendation = "Consider lower-cost or selective outreach."
+        else:
+            band = "Low likelihood"
+            band_color = RED
+            recommendation = "Do not prioritise for direct calling at this threshold."
+
+        st.markdown("<div class='section-head'>Prediction Result</div>", unsafe_allow_html=True)
+
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Predicted probability", f"{probability:.1%}")
+        r2.metric("Decision threshold", f"{prediction_threshold:.0%}")
+        r3.metric("Recommendation", "CONTACT" if contacted else "DO NOT CONTACT")
+
+        st.markdown(f"""
+        <div class='insight-box' style='border-left-color:{band_color};font-size:15px;'>
+        <strong style='color:{band_color};'>{band}</strong><br><br>
+        {recommendation}
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Closest-matching segment, estimated from pre-contact features only
+        # (age, balance, campaign contacts, prior contacts) — NOT the official
+        # duration-based K-Means label, since duration isn't known yet.
+        profiles, spread, priority_lookup = get_precontact_segment_profiles(df_seg)
+        est_segment = estimate_precontact_segment(
+            age, balance, campaign, previous_count,
+            profiles, spread
+        )
+        est_priority = priority_lookup.get(est_segment, '—')
+
+        st.markdown(f"""
+        <div class='insight-box blue'>
+        <strong>Closest segment profile:</strong> {est_segment} ({est_priority})<br>
+        <span style='font-size:12px;color:#8B949E;'>Estimated from age, balance, campaign
+        contacts and prior contacts only — the official 8-segment labels also use call
+        duration, which isn't available before this call happens. Treat this as a
+        directional match, not the customer's confirmed segment.</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class='insight-box amber'>
+        <strong>Interpretation:</strong> The probability is a model estimate, not
+        a guarantee of subscription. The threshold determines whether the customer
+        is prioritised for contact.
+        </div>
+        """, unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 4B — PRIORITY CALL LIST
+# ══════════════════════════════════════════════════════════════════════════════
+elif "Priority Call List" in page:
+
+    st.markdown("<div class='section-head'>Priority Call List</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='font-size:13px;color:#8B949E;margin-bottom:16px;'>"
+        "The exportable, ranked list a call-centre team would actually work from: "
+        "every customer scored and sorted by pre-call subscription probability."
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+    st.markdown("""
+    <div class='insight-box blue'>
+    <strong>What this demonstrates:</strong> The customers below are the same historical
+    records used to train the model — they've already been called, so their real segment
+    (which depends on call duration) is known and shown for context. In production, this
+    page would instead score NovaBank's <em>current, not-yet-contacted</em> customer
+    roster, using only the pre-call fields — the ranking logic and export are identical
+    either way. The score used to rank and filter here is always the duration-excluded
+    model, never the segment framework's post-call score, since a customer who hasn't
+    been called yet has no duration value to score with.
+    </div>
+    """, unsafe_allow_html=True)
+
+    f1, f2 = st.columns([1, 2])
+    with f1:
+        list_threshold = st.number_input(
+            "Minimum probability to include",
+            min_value=0.01, max_value=0.90, value=0.15, step=0.01, format="%.2f"
+        )
+    with f2:
+        segment_options = [s for s in df_seg['segment'].unique() if s != 'Statistical Outlier']
+        segment_filter = st.multiselect(
+            "Limit to segment(s) (optional, for context only — doesn't affect ranking)",
+            sorted(segment_options), default=[]
+        )
+
+    call_list = df_seg[df_seg['rf_precall_score'] >= list_threshold].copy()
+    if segment_filter:
+        call_list = call_list[call_list['segment'].isin(segment_filter)]
+    call_list = call_list.sort_values('rf_precall_score', ascending=False)
+
+    st.markdown(f"""
+    <div class='metric-row'>
+      <div class='metric-card green'><div class='metric-val'>{len(call_list):,}</div><div class='metric-label'>Customers on this list</div></div>
+      <div class='metric-card'><div class='metric-val'>{len(call_list)/len(df_seg):.0%}</div><div class='metric-label'>% of customer base</div></div>
+      <div class='metric-card amber'><div class='metric-val'>{call_list['rf_precall_score'].mean():.1%}</div><div class='metric-label'>Avg pre-call probability</div></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    display_cols = {
+        'rf_precall_score': 'Pre-call probability',
+        'age': 'Age', 'job': 'Job', 'marital': 'Marital',
+        'balance': 'Balance (€)', 'contact': 'Contact method',
+        'month': 'Last month', 'campaign': 'Contacts this campaign',
+        'previous': 'Prior contacts', 'segment': 'Segment (historical, post-call)',
+        'priority': 'Priority tier (historical, post-call)',
+    }
+    display = call_list.reset_index().rename(columns={'index': 'customer_id'})
+    display = display[['customer_id'] + list(display_cols.keys())].rename(columns=display_cols)
+    display['Pre-call probability'] = display['Pre-call probability'].map('{:.1%}'.format)
+
+    st.markdown("<div class='section-head'>Ranked List</div>", unsafe_allow_html=True)
+    st.dataframe(display, use_container_width=True, hide_index=True, height=420)
+
+    st.download_button(
+        "⬇  Download this list as CSV",
+        data=display.to_csv(index=False).encode('utf-8'),
+        file_name=f"novabank_priority_call_list_threshold_{list_threshold:.2f}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    st.markdown("""
+    <div class='insight-box amber'>
+    <strong>Note:</strong> 'customer_id' here is just the dataset row index — this
+    demonstration dataset has no real customer identifier. A production version would
+    join this list back to NovaBank's actual customer ID before handing it to agents.
+    </div>
+    """, unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 5 — CUSTOMER SEGMENTS
 # ══════════════════════════════════════════════════════════════════════════════
 elif "Customer Segments" in page:
 
@@ -628,7 +1044,7 @@ elif "Customer Segments" in page:
                  use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 5 — SEGMENT INSIGHTS
+# PAGE 6 — SEGMENT INSIGHTS
 # ══════════════════════════════════════════════════════════════════════════════
 elif "Insights" in page:
 
